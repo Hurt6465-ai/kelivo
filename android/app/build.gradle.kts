@@ -47,8 +47,15 @@ android {
 
     buildTypes {
         getByName("release") {
-            if (keystorePropertiesFile.exists()) {
-                signingConfig = signingConfigs.getByName("release")
+            // GitHub Actions does not have key.properties by default.
+            // Without a signingConfig the release APK can be unsigned, and some Android
+            // installers report "packageInfo is null" / parse package error.
+            // Fallback to the Android debug signing key so the APK can be installed
+            // directly for testing. Use a real release keystore before publishing.
+            signingConfig = if (keystorePropertiesFile.exists()) {
+                signingConfigs.getByName("release")
+            } else {
+                signingConfigs.getByName("debug")
             }
         }
     }
