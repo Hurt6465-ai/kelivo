@@ -10,6 +10,7 @@ import '../../../l10n/app_localizations.dart';
 import 'package:image_picker/image_picker.dart';
 import '../../../utils/file_import_helper.dart';
 import 'package:flutter/services.dart';
+import 'package:speech_to_text/speech_to_text.dart' as stt;
 import 'package:path/path.dart' as p;
 import '../../../shared/responsive/breakpoints.dart';
 import 'dart:async';
@@ -181,6 +182,12 @@ class _ChatInputBarState extends State<ChatInputBar>
   String? _imageModeModelKey;
   String? _lastImageModeModelKey;
   String? _dismissedImageModeModelKey;
+  late final stt.SpeechToText _speech;
+  bool _speechAvailable = false;
+  bool _speechInitializing = false;
+  bool _speechListening = false;
+  String _speechBaseText = '';
+  _SpeechLanguage _speechLanguage = _SpeechLanguage.defaults.first;
 
   bool get _composerLocked => widget.hasQueuedInput;
 
@@ -310,6 +317,7 @@ class _ChatInputBarState extends State<ChatInputBar>
   void initState() {
     super.initState();
     _controller = widget.controller ?? TextEditingController();
+    _speech = stt.SpeechToText();
     widget.mediaController?._bind(this);
     WidgetsBinding.instance.addObserver(this);
   }
@@ -346,6 +354,9 @@ class _ChatInputBarState extends State<ChatInputBar>
     }
     _repeatTimers.clear();
     widget.mediaController?._unbind(this);
+    try {
+      _speech.stop();
+    } catch (_) {}
     if (widget.controller == null) {
       _controller.dispose();
     }
@@ -371,6 +382,161 @@ class _ChatInputBarState extends State<ChatInputBar>
 
   /// Whether to show the expand/collapse button (when text has 3+ lines).
   bool get _showExpandButton => _lineCount >= 3;
+
+
+  void _insertRecognizedSpeech(String words) {
+    final recognized = words.trim();
+    if (recognized.isEmpty) return;
+
+    final base = _speechBaseText.trimRight();
+    final separator = base.isEmpty ? '' : '\n';
+    final nextText = '$base$separator$recognized';
+    _controller.value = TextEditingValue(
+      text: nextText,
+      selection: TextSelection.collapsed(offset: nextText.length),
+      composing: TextRange.empty,
+    );
+    setState(() {});
+    _ensureCaretVisible();
+  }
+
+  Future<bool> _ensureSpeechReady({bool showError = true}) async {
+    if (_speechAvailable) return true;
+    if (_speechInitializing) return false;
+
+    _speechInitializing = true;
+    try {
+      final available = await _speech.initialize(
+        onStatus: (status) {
+          if (!mounted) return;
+          final listening = status == 'listening';
+          final done = status == 'done' || status == 'notListening';
+          if (listening || done) {
+            setState(() => _speechListening = listening);
+          }
+        },
+        onError: (error) {
+          if (!mounted) return;
+          setState(() => _speechListening = false);
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('语音识别失败：${error.errorMsg}')),
+          );
+        },
+      );
+
+      if (!mounted) return false;
+      _speechAvailable = available;
+      if (!available && showError) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('当前设备没有可用的系统语音识别服务')),
+        );
+      }
+      return available;
+    } catch (e) {
+      if (mounted && showError) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('语音识别初始化失败：$e')),
+        );
+      }
+      return false;
+    } finally {
+      _speechInitializing = false;
+    }
+  }
+
+  Future<void> _toggleSpeechRecognition() async {
+    if (_composerLocked) return;
+
+    if (_speechListening) {
+      await _speech.stop();
+      if (mounted) setState(() => _speechListening = false);
+      return;
+    }
+
+    final ready = await _ensureSpeechReady();
+    if (!ready || !mounted) return;
+
+    _speechBaseText = _controller.text;
+    widget.focusNode?.unfocus();
+    setState(() => _speechListening = true);
+
+    await _speech.listen(
+      localeId: _speechLanguage.localeId,
+      listenMode: stt.ListenMode.dictation,
+      partialResults: true,
+      cancelOnError: false,
+      onResult: (result) {
+        if (!mounted) return;
+        _insertRecognizedSpeech(result.recognizedWords);
+        if (result.finalResult) {
+          setState(() => _speechListening = false);
+        }
+      },
+    );
+  }
+
+  Future<void> _showSpeechLanguageSheet() async {
+    if (_composerLocked) return;
+
+    final selected = await showModalBottomSheet<_SpeechLanguage>(
+      context: context,
+      showDragHandle: true,
+      backgroundColor: Theme.of(context).colorScheme.surface,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (sheetContext) {
+        final theme = Theme.of(sheetContext);
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(16, 4, 16, 18),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  '选择语音识别语言',
+                  style: theme.textTheme.titleMedium?.copyWith(
+                    fontWeight: AppFontWeights.semibold,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                GridView.count(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  crossAxisCount: 2,
+                  mainAxisSpacing: 10,
+                  crossAxisSpacing: 10,
+                  childAspectRatio: 3.4,
+                  children: [
+                    for (final lang in _SpeechLanguage.defaults)
+                      _SpeechLanguageTile(
+                        language: lang,
+                        selected: lang.localeId == _speechLanguage.localeId,
+                        onTap: () => Navigator.of(sheetContext).pop(lang),
+                      ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '短按麦克风开始/停止识别，长按这里切换语言。',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurface.withValues(alpha: 0.58),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+
+    if (selected == null || !mounted) return;
+    setState(() => _speechLanguage = selected);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('语音识别语言：${selected.label}')),
+    );
+  }
 
   Future<void> _handleSend() async {
     if (_isSubmitting) return;
@@ -1947,6 +2113,26 @@ class _ChatInputBarState extends State<ChatInputBar>
                                 ),
                                 Row(
                                   children: [
+                                    _CompactIconButton(
+                                      tooltip: _speechListening
+                                          ? '停止语音识别'
+                                          : '语音识别：${_speechLanguage.label}',
+                                      icon: _speechListening
+                                          ? Icons.mic_off
+                                          : Icons.mic,
+                                      active: _speechListening,
+                                      onTap: _composerLocked
+                                          ? null
+                                          : () => unawaited(
+                                                _toggleSpeechRecognition(),
+                                              ),
+                                      onLongPress: _composerLocked
+                                          ? null
+                                          : () => unawaited(
+                                                _showSpeechLanguageSheet(),
+                                              ),
+                                    ),
+                                    const SizedBox(width: 8),
                                     if (widget.showMoreButton) ...[
                                       _CompactIconButton(
                                         tooltip: AppLocalizations.of(
@@ -2220,6 +2406,151 @@ class _ImageModePill extends StatelessWidget {
                 ),
               ),
             ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+
+class _SpeechLanguage {
+  const _SpeechLanguage({
+    required this.flag,
+    required this.label,
+    required this.nativeLabel,
+    required this.localeId,
+  });
+
+  final String flag;
+  final String label;
+  final String nativeLabel;
+  final String localeId;
+
+  static const List<_SpeechLanguage> defaults = [
+    _SpeechLanguage(
+      flag: '🇨🇳',
+      label: '中文',
+      nativeLabel: '普通话',
+      localeId: 'zh_CN',
+    ),
+    _SpeechLanguage(
+      flag: '🇺🇸',
+      label: '英语',
+      nativeLabel: 'English',
+      localeId: 'en_US',
+    ),
+    _SpeechLanguage(
+      flag: '🇲🇲',
+      label: '缅文',
+      nativeLabel: 'မြန်မာ',
+      localeId: 'my_MM',
+    ),
+    _SpeechLanguage(
+      flag: '🇹🇭',
+      label: '泰语',
+      nativeLabel: 'ไทย',
+      localeId: 'th_TH',
+    ),
+    _SpeechLanguage(
+      flag: '🇯🇵',
+      label: '日语',
+      nativeLabel: '日本語',
+      localeId: 'ja_JP',
+    ),
+    _SpeechLanguage(
+      flag: '🇰🇷',
+      label: '韩语',
+      nativeLabel: '한국어',
+      localeId: 'ko_KR',
+    ),
+    _SpeechLanguage(
+      flag: '🇻🇳',
+      label: '越南语',
+      nativeLabel: 'Tiếng Việt',
+      localeId: 'vi_VN',
+    ),
+    _SpeechLanguage(
+      flag: '🇮🇩',
+      label: '印尼语',
+      nativeLabel: 'Bahasa Indonesia',
+      localeId: 'id_ID',
+    ),
+  ];
+}
+
+class _SpeechLanguageTile extends StatelessWidget {
+  const _SpeechLanguageTile({
+    required this.language,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final _SpeechLanguage language;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final bg = selected
+        ? theme.colorScheme.primaryContainer.withValues(alpha: 0.86)
+        : theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.55);
+    final border = selected
+        ? theme.colorScheme.primary.withValues(alpha: 0.54)
+        : theme.colorScheme.outline.withValues(alpha: 0.14);
+    final fg = selected
+        ? theme.colorScheme.onPrimaryContainer
+        : theme.colorScheme.onSurface;
+
+    return Material(
+      color: bg,
+      borderRadius: BorderRadius.circular(16),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(16),
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: border, width: 1),
+          ),
+          child: Row(
+            children: [
+              Text(language.flag, style: const TextStyle(fontSize: 24)),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      language.label,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: fg,
+                        fontSize: 14,
+                        fontWeight: AppFontWeights.semibold,
+                      ),
+                    ),
+                    Text(
+                      language.nativeLabel,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        color: fg.withValues(alpha: 0.68),
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              if (selected)
+                Icon(
+                  Icons.check_rounded,
+                  size: 18,
+                  color: theme.colorScheme.primary,
+                ),
+            ],
           ),
         ),
       ),
