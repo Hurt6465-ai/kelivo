@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.net.Uri
 import android.content.Intent
+import android.speech.RecognizerIntent
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -13,15 +14,19 @@ import java.io.FileInputStream
 class MainActivity : FlutterActivity() {
     private companion object {
         const val CREATE_DOCUMENT_REQUEST_CODE = 4107
+        const val SPEECH_RECOGNITION_REQUEST_CODE = 4108
     }
 
     private val processTextChannelName = "app.process_text"
     private val fileSaveChannelName = "app.file_save"
+    private val speechIntentChannelName = "app.speech_intent"
     private var processTextChannel: MethodChannel? = null
     private var fileSaveChannel: MethodChannel? = null
+    private var speechIntentChannel: MethodChannel? = null
     private var pendingProcessText: String? = null
     private var pendingSaveResult: MethodChannel.Result? = null
     private var pendingSaveSourcePath: String? = null
+    private var pendingSpeechResult: MethodChannel.Result? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -43,6 +48,13 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+        speechIntentChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, speechIntentChannelName)
+        speechIntentChannel?.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "recognize" -> handleSpeechRecognize(call.arguments, result)
+                else -> result.notImplemented()
+            }
+        }
         pendingProcessText = extractProcessText(intent)
     }
 
@@ -60,12 +72,59 @@ class MainActivity : FlutterActivity() {
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == SPEECH_RECOGNITION_REQUEST_CODE) {
+            handleSpeechResult(resultCode, data)
+            return
+        }
         if (requestCode != CREATE_DOCUMENT_REQUEST_CODE) {
             return
         }
 
         val destUri = if (resultCode == Activity.RESULT_OK) data?.data else null
         handleSaveDestination(destUri)
+    }
+
+    private fun handleSpeechRecognize(arguments: Any?, result: MethodChannel.Result) {
+        if (pendingSpeechResult != null) {
+            result.error("busy", "Another speech recognition operation is already in progress.", null)
+            return
+        }
+
+        val args = arguments as? Map<*, *>
+        val localeId = args?.get("localeId")?.toString()?.trim().orEmpty().replace('_', '-')
+        val prompt = args?.get("prompt")?.toString()?.trim().takeUnless { it.isNullOrEmpty() }
+            ?: "请开始说话"
+
+        val speechIntent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(RecognizerIntent.EXTRA_PROMPT, prompt)
+            if (localeId.isNotEmpty()) {
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE, localeId)
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, localeId)
+            }
+        }
+
+        pendingSpeechResult = result
+        try {
+            startActivityForResult(speechIntent, SPEECH_RECOGNITION_REQUEST_CODE)
+        } catch (e: ActivityNotFoundException) {
+            pendingSpeechResult = null
+            result.error("unavailable", e.message ?: "No system speech recognition activity found.", null)
+        } catch (e: Exception) {
+            pendingSpeechResult = null
+            result.error("launch_failed", e.message, null)
+        }
+    }
+
+    private fun handleSpeechResult(resultCode: Int, data: Intent?) {
+        val result = pendingSpeechResult ?: return
+        pendingSpeechResult = null
+        if (resultCode != Activity.RESULT_OK) {
+            result.success(null)
+            return
+        }
+        val matches = data?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+        result.success(matches?.firstOrNull()?.trim()?.takeIf { it.isNotEmpty() })
     }
 
     private fun extractProcessText(intent: Intent?): String? {
